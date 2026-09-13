@@ -106,11 +106,20 @@ sudo zypper install -y kernel-devel dkms git gcc make
 
 ### Step 2: Clone the Driver Source Code
 
-Clone the community MT7902 driver into the system DKMS source directory:
+Clone the community MT7902 driver source into your DKMS directory. You can use any of the active community repositories:
+
 ```bash
-sudo git clone https://github.com/kimocoder/mt7902.git /usr/src/mt7902-wifi-1.0
+# Option 1: OnlineLearningTutorials / mt7902_temp (Most popular community repo)
+sudo git clone https://github.com/OnlineLearningTutorials/mt7902_temp.git /usr/src/mt7902-wifi-1.0
+
+# Option 2: samveen / mt7902-dkms
+sudo git clone https://github.com/samveen/mt7902-dkms.git /usr/src/mt7902-wifi-1.0
+
+# Option 3: hmtheboy154 / gen4-mt7902
+sudo git clone https://github.com/hmtheboy154/gen4-mt7902.git /usr/src/mt7902-wifi-1.0
 ```
-*(If you already have a community driver downloaded, ensure its directory is placed in `/usr/src/mt7902-wifi-1.0` or adjust the DKMS path accordingly).*
+
+*(If you already have a community driver downloaded or in another folder, ensure it is copied or placed in `/usr/src/mt7902-wifi-1.0` or adjust the DKMS path accordingly).*
 
 ---
 
@@ -277,9 +286,11 @@ Support for `14c3:7902` is merged upstream into mainline Linux **Kernel 7.1+**. 
 
 ## 🤝 Credits & Acknowledgments
 
-This guide, patch, and diagnostic tooling build upon the collective troubleshooting and reverse-engineering efforts of the open-source Linux community:
+This guide, patch, and diagnostic tooling build upon the collective troubleshooting and development efforts of the open-source Linux community:
 
-* **[kimocoder/mt7902](https://github.com/kimocoder/mt7902)**: For pioneering the out-of-tree MT7902 DKMS driver tree and backporting MediaTek `mt76` support for the `14c3:7902` PCI ID.
+* **[OnlineLearningTutorials/mt7902_temp](https://github.com/OnlineLearningTutorials/mt7902_temp)**: For maintaining the primary community MT7902 Linux driver development repository.
+* **[hmtheboy154/gen4-mt7902](https://github.com/hmtheboy154/gen4-mt7902)** & **[samveen/mt7902-dkms](https://github.com/samveen/mt7902-dkms)**: For community DKMS packaging and driver build scripts.
+* **[morrownr/mt76](https://github.com/morrownr/mt76)**: Nick Morrow for providing out-of-tree Linux driver support and documentation for MediaTek wireless chips.
 * **Linux Wireless & `mt76` Maintainers**: Felix Fietkau, Lorenzo Bianconi, and the MediaTek kernel team for maintaining the upstream `mt76` / `mt7921` subsystem.
 * **ASUS & Arch Linux Communities**: Enthusiasts across the ASUS Linux forums, Arch BBS, and Reddit (`r/linux4noobs`, `r/asus`) who documented hardware quirks, PTA coexistence clashes, and PCIe ASPM L1 sleep bugs on the ASUS Vivobook Go series.
 
