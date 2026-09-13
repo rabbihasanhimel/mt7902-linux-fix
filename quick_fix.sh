@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# ============================================================
-#  MediaTek MT7902 Quick Diagnostics & Network Optimizer
-#  Targeted for: ASUS Vivobook Go E1404FA & MT7902 laptops
-#  Credits: Community MT7902 DKMS contributors & mt76 maintainers
-# ============================================================
+# ==============================================================================
+#  MediaTek MT7902 Quick Diagnostics, Optimizer & Speed Fix Tool
+# ==============================================================================
+#  Use this tool to:
+#   1. Apply the 1.5–3 Mbps speed fix (enables antenna diversity / antenna_mask=3)
+#   2. Disable PCIe ASPM sleep hangs & disconnects (disable_aspm=y)
+#   3. Disable Wi-Fi power saving in NetworkManager (wifi.powersave = 2)
+#   4. Detect secondary USB Wi-Fi dongles and prevent ARP / routing conflicts
+#   5. Check Bluetooth & 2.4 GHz radio contention
+#   6. Optimize NetworkManager connection profiles
+#   7. Benchmark live link rates (TX/RX bitrate) and real-world download speed
+# ==============================================================================
+
 set -euo pipefail
 
 GREEN='\033[0;32m'
@@ -11,178 +19,170 @@ CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 BOLD='\033[1m'
-NC='\033[0m'
+RESET='\033[0m'
 
-echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}${BOLD}     MediaTek MT7902 Optimizer & Diagnostics Tool           ${NC}"
-echo -e "${CYAN}============================================================${NC}"
+TARGET_ANTENNA_MASK=3
+
+# ── Parse Arguments ───────────────────────────────────────────────────────────
+for arg in "$@"; do
+    case "$arg" in
+        --antenna=*) TARGET_ANTENNA_MASK="${arg#--antenna=}" ;;
+        --antenna)   shift; TARGET_ANTENNA_MASK="${1:-3}" ;;
+        -h|--help)
+            echo "Usage: sudo bash $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --antenna <1|2|3>  Set specific antenna mask:"
+            echo "                       1 = Chain 0 (MAIN only)"
+            echo "                       2 = Chain 1 (AUX only)"
+            echo "                       3 = Both chains (MIMO & MRC Diversity - Default & Recommended)"
+            echo "  -h, --help         Show this help message"
+            exit 0
+            ;;
+    esac
+done
+
+echo -e "${CYAN}============================================================${RESET}"
+echo -e "${CYAN}${BOLD}       MediaTek MT7902 Optimizer & Diagnostics Tool         ${RESET}"
+echo -e "${CYAN}============================================================${RESET}"
 
 if [[ $EUID -ne 0 ]]; then
-   echo -e "${RED}Please run this script with sudo: sudo bash $0${NC}"
-   exit 1
+    echo -e "${RED}Please run this script with sudo: sudo bash $0${RESET}"
+    exit 1
 fi
 
-# 1. PCIe ASPM Fix
-echo -e "\n${CYAN}[1/6] Configuring PCIe ASPM settings...${NC}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 0. Check if MT7902 driver is installed
+if ! lsmod | grep -q mt7921 && ! command -v dkms &>/dev/null; then
+    echo -e "\n${YELLOW}⚠️  Driver does not appear to be loaded.${RESET}"
+    if [[ -f "$SCRIPT_DIR/install.sh" ]]; then
+        echo -e "   Run the full installer first: ${BOLD}sudo bash $SCRIPT_DIR/install.sh${RESET}\n"
+    fi
+fi
+
+# 1. PCIe ASPM & Antenna Diversity Fix
+echo -e "\n${CYAN}[1/6] Configuring PCIe ASPM and Antenna Mask (Speed & Stability Fix)...${RESET}"
 mkdir -p /etc/modprobe.d
-echo "options mt7921e disable_aspm=y" > /etc/modprobe.d/mt7921e.conf
-echo -e "${GREEN}✓ PCIe ASPM disabled for mt7921e in /etc/modprobe.d/mt7921e.conf${NC}"
+
+cat > /etc/modprobe.d/mt7921e.conf << EOF
+# MT7902 Driver Performance & Stability Configuration
+options mt7921e disable_aspm=y
+options mt7921_common antenna_mask=${TARGET_ANTENNA_MASK}
+EOF
+
+echo -e "${GREEN}✓ Set disable_aspm=y (PCIe wake sleep fix)${RESET}"
+echo -e "${GREEN}✓ Set antenna_mask=${TARGET_ANTENNA_MASK} (Receiver diversity & speed fix) in /etc/modprobe.d/mt7921e.conf${RESET}"
+
+# Reload module if loaded to apply settings immediately
+if lsmod | grep -q mt7921e; then
+    echo -e "  Applying driver settings cleanly without reboot..."
+    rmmod mt7921e 2>/dev/null || true
+    rmmod mt7921_common 2>/dev/null || true
+    modprobe mt7921_common
+    modprobe mt7921e
+    sleep 2
+    echo -e "${GREEN}✓ mt7921 kernel modules reloaded successfully.${RESET}"
+fi
 
 # 2. Wi-Fi Powersave Fix
-echo -e "\n${CYAN}[2/6] Disabling NetworkManager Wi-Fi powersave...${NC}"
+echo -e "\n${CYAN}[2/6] Disabling NetworkManager Wi-Fi powersave...${RESET}"
 mkdir -p /etc/NetworkManager/conf.d
 cat > /etc/NetworkManager/conf.d/wifi-powersave-off.conf << 'EOF'
 [connection]
+# Disable WiFi powersave to eliminate beacon dropouts and latency spikes
 wifi.powersave = 2
 EOF
-echo -e "${GREEN}✓ Powersave disabled in /etc/NetworkManager/conf.d/wifi-powersave-off.conf${NC}"
+echo -e "${GREEN}✓ Powersave disabled in /etc/NetworkManager/conf.d/wifi-powersave-off.conf${RESET}"
 
-# 3. Detect Wireless Interfaces & Driver State
-echo -e "\n${CYAN}[3/6] Inspecting Wireless Interfaces & Driver State...${NC}"
-
-# Check if kernel module is loaded
-if ! lsmod 2>/dev/null | grep -qE '^mt7921e '; then
-    echo -e "${YELLOW}ℹ mt7921e driver module is not loaded yet. Attempting to load...${NC}"
-    modprobe mt7921e 2>/dev/null || true
-fi
-
-PCIE_IFACE=""
-USB_IFACE=""
-
-# Method A: Search through sysfs for interface bound to mt7921e or PCI wireless
-for dev in /sys/class/net/*; do
-    [[ ! -d "$dev" ]] && continue
-    iface_name=$(basename "$dev")
-    [[ "$iface_name" == "lo" ]] && continue
-    
-    # Must be a wireless device (has /wireless or /phy80211)
-    if [[ -d "$dev/wireless" || -d "$dev/phy80211" ]]; then
-        driver=""
-        if [[ -e "$dev/device/driver" ]]; then
-            driver=$(basename "$(readlink -f "$dev/device/driver" 2>/dev/null || true)")
-        fi
-        device_path=$(readlink -f "$dev/device" 2>/dev/null || true)
-        
-        # Check if driver is mt7921e/mt7921 or device is on PCIe bus
-        if [[ "$driver" =~ mt7921|mt7902 ]] || [[ "$device_path" =~ /pci ]]; then
-            if [[ -z "$PCIE_IFACE" ]]; then
-                PCIE_IFACE="$iface_name"
-            fi
-        elif [[ "$device_path" =~ /usb ]] || [[ "$driver" =~ mt7601|rtl|rtw ]]; then
-            if [[ -z "$USB_IFACE" ]]; then
-                USB_IFACE="$iface_name"
-            fi
-        fi
-    fi
-done
-
-# Method B Fallback: Predictable interface names via ip link
-if [[ -z "$PCIE_IFACE" ]]; then
-    PCIE_IFACE=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^wl(p|s|o)' | head -n1 || true)
-fi
-if [[ -z "$PCIE_IFACE" ]]; then
-    # Fallback to wlan* if it's the only wireless interface
-    PCIE_IFACE=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^wlan[0-9]' | head -n1 || true)
-fi
-if [[ -z "$USB_IFACE" ]]; then
-    USB_IFACE=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^wlx' | head -n1 || true)
-fi
+# 3. Detect Wireless Interfaces
+echo -e "\n${CYAN}[3/6] Inspecting Wireless Interfaces...${RESET}"
+PCIE_IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^wlp' | head -n1 || true)
+USB_IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^wlx' | head -n1 || true)
 
 if [[ -n "$PCIE_IFACE" ]]; then
-    echo -e "${GREEN}✓ Found primary MT7902 wireless interface: ${BOLD}${PCIE_IFACE}${NC}"
+    echo -e "${GREEN}✓ Found primary MT7902 PCIe interface: ${BOLD}${PCIE_IFACE}${RESET}"
 else
-    echo -e "${YELLOW}! No MT7902 wireless interface found.${NC}"
-    echo -e "  If you haven't built the DKMS module yet, follow Step 1-4 in README.md."
-    echo -e "  If already built, try: ${BOLD}sudo modprobe mt7921e${NC}"
+    echo -e "${YELLOW}! No PCIe wireless interface (wlp*) found yet.${RESET}"
+    echo -e "  Verify module status with: ${BOLD}sudo dmesg | grep -i mt79${RESET}"
 fi
 
 if [[ -n "$USB_IFACE" ]]; then
-    echo -e "${YELLOW}⚠️  Detected secondary USB Wi-Fi dongle: ${BOLD}${USB_IFACE}${NC}"
-    echo -e "   If you no longer need the USB dongle, please unplug it to avoid routing metric conflicts."
+    echo -e "\n${YELLOW}⚠️  Detected secondary USB Wi-Fi dongle: ${BOLD}${USB_IFACE}${RESET}"
+    echo -e "   ${BOLD}CRITICAL:${RESET} If you no longer need the USB dongle, please ${BOLD}unplug it${RESET}."
+    echo -e "   Having both adapters active creates dual default routes and ARP conflicts,"
+    echo -e "   forcing your traffic through the slower adapter."
 fi
 
 # 4. Bluetooth Coexistence Check
-echo -e "\n${CYAN}[4/6] Checking Bluetooth & 2.4 GHz Coexistence...${NC}"
+echo -e "\n${CYAN}[4/6] Checking Bluetooth & 2.4 GHz Coexistence...${RESET}"
 if command -v bluetoothctl &>/dev/null; then
     BT_POWERED=$(bluetoothctl show 2>/dev/null | grep -i "Powered: yes" || true)
     if [[ -n "$BT_POWERED" ]]; then
-        echo -e "${YELLOW}ℹ Bluetooth is currently ON.${NC}"
-        echo -e "  Reminder: MT7902 uses a single antenna shared between 2.4 GHz Wi-Fi and Bluetooth."
-        echo -e "  If connecting to a 2.4 GHz network while using a Bluetooth mouse/headset,"
-        echo -e "  temporarily toggle Bluetooth off during connection: ${BOLD}bluetoothctl power off${NC}"
+        echo -e "${YELLOW}ℹ Bluetooth is currently ON.${RESET}"
+        echo -e "  Reminder: MT7902 shares its radio path between 2.4 GHz Wi-Fi and Bluetooth."
+        echo -e "  If connecting to 2.4 GHz networks with an active Bluetooth mouse/headset,"
+        echo -e "  temporarily toggle Bluetooth off during connection:"
+        echo -e "      ${BOLD}bluetoothctl power off${RESET}"
+        echo -e "  (Connecting to 5 GHz networks avoids this completely)."
     else
-        echo -e "${GREEN}✓ Bluetooth is OFF (No 2.4 GHz radio contention).${NC}"
+        echo -e "${GREEN}✓ Bluetooth is OFF (No 2.4 GHz radio contention).${RESET}"
     fi
-else
-    echo -e "  bluetoothctl not found, skipping Bluetooth status check."
 fi
 
-# 5. Prioritize 5 GHz Networks in NetworkManager
-echo -e "\n${CYAN}[5/6] Optimizing NetworkManager Profiles...${NC}"
+# 5. NetworkManager Profile Optimization
+echo -e "\n${CYAN}[5/6] Optimizing NetworkManager Profiles...${RESET}"
 if command -v nmcli &>/dev/null && [[ -n "$PCIE_IFACE" ]]; then
-    # Look for connections explicitly named with 5G / 5GHz
-    CONNS_5G=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ':802-11-wireless$' | sed 's/:802-11-wireless$//' | grep -iE '(_5G|-5G| 5G|_5GHz|-5GHz| 5GHz)' || true)
-    
-    if [[ -n "$CONNS_5G" ]]; then
+    WIFI_CONNS=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ':802-11-wireless' | awk -F':' '{print $1}' || true)
+
+    if [[ -n "$WIFI_CONNS" ]]; then
         while IFS= read -r conn; do
             [[ -z "$conn" ]] && continue
-            echo -e "  Prioritizing 5 GHz connection profile: ${BOLD}${conn}${NC}"
-            nmcli connection modify "$conn" connection.interface-name "$PCIE_IFACE" connection.autoconnect yes connection.autoconnect-priority 100 2>/dev/null || true
-            echo -e "  ${GREEN}✓ Set autoconnect-priority=100 and bound to ${PCIE_IFACE}${NC}"
-        done <<< "$CONNS_5G"
-    else
-        echo -e "  No profiles with explicit '5G' naming detected."
-        echo -e "  ${YELLOW}Tip:${NC} If your router uses a single unified SSID for 2.4GHz and 5GHz, you can"
-        echo -e "       force NetworkManager to stick to 5 GHz using:"
-        echo -e "       ${BOLD}nmcli connection modify \"<SSID>\" 802-11-wireless.band a${NC}"
+            nmcli connection modify "$conn" connection.interface-name "$PCIE_IFACE" connection.autoconnect yes connection.autoconnect-priority 50 2>/dev/null || true
+            echo -e "  ${GREEN}✓ Bound '${BOLD}${conn}${RESET}${GREEN}' to ${PCIE_IFACE} with priority 50${RESET}"
+        done <<< "$WIFI_CONNS"
     fi
     nmcli general reload 2>/dev/null || true
-    echo -e "${GREEN}✓ NetworkManager configuration reloaded.${NC}"
-else
-    echo -e "  NetworkManager (nmcli) or PCIe interface not available, skipping profile tuning."
+    echo -e "${GREEN}✓ NetworkManager configuration reloaded.${RESET}"
 fi
 
-# 6. Live Status & Diagnostics
-echo -e "\n${CYAN}[6/6] Real-Time Link & Connection Diagnostics...${NC}"
-if [[ -n "$PCIE_IFACE" ]]; then
-    LINK_OK=false
-    
-    if command -v iw &>/dev/null; then
-        LINK_OUTPUT=$(iw dev "$PCIE_IFACE" link 2>/dev/null || true)
-        if echo "$LINK_OUTPUT" | grep -q "Connected to"; then
-            LINK_OK=true
-            SSID=$(echo "$LINK_OUTPUT" | grep "SSID:" | awk '{$1=""; print $0}' | sed 's/^ //')
-            FREQ=$(echo "$LINK_OUTPUT" | grep "freq:" | awk '{print $2}')
-            SIG=$(echo "$LINK_OUTPUT" | grep "signal:" | awk '{$1=$1};1')
-            TX=$(echo "$LINK_OUTPUT" | grep "tx bitrate:" | awk '{$1=$1};1')
-            
-            echo -e "${GREEN}✓ ${PCIE_IFACE} is CONNECTED to: ${BOLD}${SSID}${NC}"
-            echo -e "  Frequency : ${FREQ} MHz"
-            echo -e "  Signal    : ${SIG}"
-            echo -e "  Bitrate   : ${TX}"
+# 6. Live Status & Speed Benchmark
+echo -e "\n${CYAN}[6/6] Real-Time Link & Connection Diagnostics...${RESET}"
+if [[ -n "$PCIE_IFACE" ]] && command -v iw &>/dev/null; then
+    LINK_OUTPUT=$(iw dev "$PCIE_IFACE" link 2>/dev/null || true)
+    if echo "$LINK_OUTPUT" | grep -q "Connected to"; then
+        SSID=$(echo "$LINK_OUTPUT" | grep "SSID:" | awk '{print $2}')
+        FREQ=$(echo "$LINK_OUTPUT" | grep "freq:" | awk '{print $2}')
+        SIG=$(echo "$LINK_OUTPUT" | grep "signal:" | awk '{$1=$1};1')
+        TX=$(echo "$LINK_OUTPUT" | grep "tx bitrate:" | awk '{$1=$1};1')
+        RX=$(echo "$LINK_OUTPUT" | grep "rx bitrate:" | awk '{$1=$1};1' || true)
+
+        echo -e "${GREEN}✓ ${PCIE_IFACE} is CONNECTED to: ${BOLD}${SSID}${RESET}"
+        echo -e "  Frequency : ${FREQ} MHz"
+        echo -e "  Signal    : ${SIG}"
+        echo -e "  TX Rate   : ${TX}"
+        if [[ -n "$RX" ]]; then
+            echo -e "  RX Rate   : ${RX}"
+            if echo "$RX" | grep -q "6.0 MBit/s"; then
+                echo -e "  ${YELLOW}⚠️  Notice: RX bitrate is at 6.0 Mbps. Verify antenna_mask=3 is active.${RESET}"
+            fi
         fi
-    fi
-    
-    if [[ "$LINK_OK" = false ]] && command -v nmcli &>/dev/null; then
-        NM_STATUS=$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION dev 2>/dev/null | grep "^${PCIE_IFACE}:wifi:connected:" || true)
-        if [[ -n "$NM_STATUS" ]]; then
-            LINK_OK=true
-            SSID=$(echo "$NM_STATUS" | cut -d':' -f4)
-            echo -e "${GREEN}✓ ${PCIE_IFACE} is CONNECTED via NetworkManager to: ${BOLD}${SSID}${NC}"
+
+        echo -e "\n  Testing gateway latency via ${PCIE_IFACE}..."
+        ping -c 3 -I "$PCIE_IFACE" -W 2 1.1.1.1 2>/dev/null || ping -c 3 -W 2 8.8.8.8 2>/dev/null || true
+
+        echo -e "\n  Benchmarking live download throughput via ${PCIE_IFACE}..."
+        SPEED=$(curl -s -w "%{speed_download}" -o /dev/null --interface "$PCIE_IFACE" --max-time 6 https://speed.cloudflare.com/__down?bytes=25000000 2>/dev/null || echo "0")
+        if [[ "$SPEED" != "0" ]]; then
+            MBPS=$(awk -v s="$SPEED" 'BEGIN { printf "%.2f", (s * 8) / 1000000 }')
+            echo -e "  ${GREEN}${BOLD}Download Speed: ${MBPS} Mbps${RESET}"
         fi
-    fi
-    
-    if [[ "$LINK_OK" = true ]]; then
-        echo -e "\n  Testing internet latency via ${PCIE_IFACE}..."
-        ping -c 3 -W 2 1.1.1.1 2>/dev/null || ping -c 3 -W 2 8.8.8.8 2>/dev/null || true
     else
-        echo -e "${YELLOW}! ${PCIE_IFACE} is currently disconnected.${NC}"
-        echo -e "  Connect via: nmcli dev wifi connect <SSID> password <PASSWORD> ifname ${PCIE_IFACE}"
+        echo -e "${YELLOW}! ${PCIE_IFACE} is currently disconnected.${RESET}"
+        echo -e "  Connect with: ${BOLD}nmcli dev wifi connect <SSID> password <PASSWORD> ifname ${PCIE_IFACE}${RESET}"
     fi
-else
-    echo -e "${YELLOW}! No interface detected to run link diagnostics.${NC}"
 fi
 
-echo -e "\n${GREEN}============================================================${NC}"
-echo -e "${GREEN}${BOLD}                  Optimization Complete!                   ${NC}"
-echo -e "${GREEN}============================================================${NC}\n"
+echo -e "\n${GREEN}============================================================${RESET}"
+echo -e "${GREEN}${BOLD}                 Optimization Complete!                    ${RESET}"
+echo -e "${GREEN}============================================================${RESET}\n"
